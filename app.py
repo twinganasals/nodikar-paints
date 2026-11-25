@@ -9,6 +9,7 @@ import ast
 import operator
 import json
 import streamlit.components.v1 as components
+from contextlib import contextmanager
 
 # =============================================================================
 # 1. PAGE CONFIG & CUSTOM DESIGN
@@ -42,11 +43,29 @@ def get_secret_db_url():
     try: return st.secrets["postgres"]["url"]
     except Exception: return None
 
+def can_write():
+    """Only admins and editors may add, edit or delete. Everyone else is view-only."""
+    return st.session_state.get("role") in ("admin", "editor")
+
+@contextmanager
+def system_writes():
+    """Lets the app's own housekeeping (table setup, back-fills) write even when a view-only user is logged in."""
+    st.session_state["_system"] = True
+    try: yield
+    finally: st.session_state["_system"] = False
+
 def get_connection():
     url = get_secret_db_url()
-    if url: return psycopg2.connect(url)
-    # Local fallback. The password is read from the DB_PASSWORD environment variable, not stored in the code.
-    return psycopg2.connect(host="localhost", port="5432", database="enterprise_blueprint", user="postgres", password=os.environ.get("DB_PASSWORD", ""))
+    if url: conn = psycopg2.connect(url)
+    else:
+        # Local fallback. The password is read from the DB_PASSWORD environment variable, not stored in the code.
+        conn = psycopg2.connect(host="localhost", port="5432", database="enterprise_blueprint", user="postgres", password=os.environ.get("DB_PASSWORD", ""))
+    # View-only users get a read-only database session: the database itself refuses any write they attempt.
+    if st.session_state.get("logged_in") and not st.session_state.get("_system") and not can_write():
+        conn.set_session(readonly=True)
+    return conn
+
+VIEW_ONLY_MSG = "You have view-only access. Ask the administrator for permission to add or edit records."
 
 def report_invalid_numbers():
     """Show the error now, and again after any st.rerun() (the script end clears it if no rerun happened)."""
@@ -71,6 +90,7 @@ def run_query(query, params=None, fetch=False):
             conn.commit()
         return "OK"
     except psycopg2.errors.UniqueViolation: conn.rollback(); return "DUPLICATE"
+    except psycopg2.errors.ReadOnlySqlTransaction: conn.rollback(); st.error(VIEW_ONLY_MSG); return pd.DataFrame() if fetch else "ERROR"
     except psycopg2.errors.ForeignKeyViolation: conn.rollback(); return "IN_USE"
     except psycopg2.errors.UndefinedTable as e: conn.rollback(); st.error(f"⚠️ Missing Table: {e}"); return pd.DataFrame() 
     except Exception as e: conn.rollback(); st.error(f"DB Error: {e}"); return pd.DataFrame() if fetch else "ERROR"
@@ -91,6 +111,8 @@ def insert_returning_id(query, params):
             new_id = cur.fetchone()[0]
             conn.commit()
         return new_id
+    except psycopg2.errors.ReadOnlySqlTransaction:
+        conn.rollback(); st.error(VIEW_ONLY_MSG); return None
     except Exception as e:
         conn.rollback(); st.error(f"DB Error: {e}"); return None
     finally: conn.close()
@@ -279,6 +301,22 @@ def ensure_payment_tables():
                  WHERE p.status = 'Cleared' AND COALESCE(p.total_payout, 0) > 0
                    AND NOT EXISTS (SELECT 1 FROM purchase_payments pp WHERE pp.purchase_id = p.purchase_id)""")
 
+def ensure_user_roles():
+    """Adds a role to every user: 'viewer' (view only), 'editor' (can add/edit/delete) or 'admin' (editor + manages users).
+    New registrations are viewers until an admin changes them. The admin is the username in secrets ([app] admin_username);
+    if no admin exists yet, the earliest registered user becomes admin."""
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'viewer'")
+    try: admin_user = st.secrets["app"]["admin_username"]
+    except Exception: admin_user = None
+    if admin_user: run_query("UPDATE users SET role = 'admin' WHERE username = %s", (admin_user,))
+    has_admin = run_query("SELECT 1 FROM users WHERE role = 'admin' LIMIT 1", fetch=True)
+    if isinstance(has_admin, pd.DataFrame) and has_admin.empty:
+        run_query("UPDATE users SET role = 'admin' WHERE user_id = (SELECT MIN(user_id) FROM users)")
+
+if "roles_ready" not in st.session_state:
+    with system_writes(): ensure_user_roles()
+    st.session_state.roles_ready = True
+
 # =============================================================================
 # 3. LOGIN SYSTEM
 # =============================================================================
@@ -298,9 +336,11 @@ if not st.session_state.logged_in:
             with st.form("login_form"):
                 login_user = st.text_input("Username"); login_pass = st.text_input("Password", type="password")
                 if st.form_submit_button("Sign In"):
-                    result = run_query("SELECT user_id, full_name FROM users WHERE username = %s AND password_hash = %s", (login_user, hash_password(login_pass)), fetch=True)
+                    result = run_query("SELECT user_id, full_name, role FROM users WHERE username = %s AND password_hash = %s", (login_user, hash_password(login_pass)), fetch=True)
                     if isinstance(result, pd.DataFrame) and not result.empty:
-                        st.session_state.logged_in = True; st.session_state.user_name = result.iloc[0]['full_name']; st.rerun()
+                        st.session_state.logged_in = True; st.session_state.user_name = result.iloc[0]['full_name']
+                        st.session_state.user_id = int(result.iloc[0]['user_id']); st.session_state.username = login_user
+                        st.session_state.role = result.iloc[0]['role'] or "viewer"; st.rerun()
                     else: st.error("Invalid username or password.")
         with tab_register:
             with st.form("register_form"):
@@ -312,27 +352,50 @@ if not st.session_state.logged_in:
                     else:
                         res = run_query("INSERT INTO users (username, password_hash, full_name) VALUES (%s, %s, %s)", (reg_user, hash_password(reg_pass), reg_fullname))
                         if res == "DUPLICATE": st.error("Username taken.")
-                        elif res == "OK": st.success("Account created! Log in now.")
+                        elif res == "OK": st.success("Account created! You can log in now. New accounts are view-only until the administrator grants edit permission.")
     st.markdown("</div>", unsafe_allow_html=True)
     st.stop() 
 
 # =============================================================================
 # 4. MAIN APP
 # =============================================================================
+# Re-read this user's role on every run, so the administrator's changes take effect immediately
+_role_df = run_query("SELECT role FROM users WHERE user_id = %s", (int(st.session_state.user_id),), fetch=True) if st.session_state.get("user_id") else pd.DataFrame()
+if not isinstance(_role_df, pd.DataFrame) or _role_df.empty:
+    st.session_state.logged_in = False; st.rerun()   # account removed, or session from before roles existed: sign in again
+st.session_state.role = _role_df.iloc[0]["role"] or "viewer"
+is_admin = st.session_state.role == "admin"
+
 head_col1, head_col2, head_col3 = st.columns([1, 7, 2])
 with head_col1:
     if os.path.exists("logo.png"): st.image("logo.png", use_container_width=True)
 with head_col2: st.title("Nodikar Paints: Enterprise Portal")
 with head_col3:
-    st.markdown(f"**Welcome, {st.session_state.get('user_name', 'User')}**")
-    if st.button("Logout"): st.session_state.logged_in = False; st.rerun()
+    st.markdown(f"**Welcome, {st.session_state.get('user_name', 'User')}** ({st.session_state.role})")
+    if st.button("Logout"):
+        for _k in ("logged_in", "role", "user_id", "username"): st.session_state.pop(_k, None)
+        st.rerun()
 st.markdown("<hr style='border: 1px solid #334155;'>", unsafe_allow_html=True)
+
+# View-only users: every save / delete / edit button is greyed out (and the database refuses writes as a second lock)
+if not getattr(st.form_submit_button, "_guarded", False):
+    _orig_form_submit, _orig_button = st.form_submit_button, st.button
+    def _guarded_form_submit(*a, **k):
+        if st.session_state.get("logged_in") and not can_write(): k["disabled"] = True
+        return _orig_form_submit(*a, **k)
+    def _guarded_button(label, *a, **k):
+        if st.session_state.get("logged_in") and not can_write() and label != "Logout": k["disabled"] = True
+        return _orig_button(label, *a, **k)
+    _guarded_form_submit._guarded = True
+    st.form_submit_button = _guarded_form_submit; st.button = _guarded_button
+if not can_write(): st.info("👁️ View-only access. Ask the administrator for permission to add or edit records.")
 
 enable_arrow_navigation()
 for _m in st.session_state.pop("flash_transient", []): st.error(_m)
 
 if "payment_tables_ready" not in st.session_state:
-    ensure_payment_tables(); backfill_commission_expenses(); st.session_state.payment_tables_ready = True
+    with system_writes(): ensure_payment_tables(); backfill_commission_expenses()
+    st.session_state.payment_tables_ready = True
 
 try:
     agents_df = run_query("SELECT agent_id, agent_name FROM agents ORDER BY agent_name", fetch=True)
@@ -351,9 +414,11 @@ supplier_map = dict(zip(suppliers_df["supplier_name"], suppliers_df["supplier_id
 client_map = dict(zip(clients_df["client_name"], clients_df["client_id"])) if not clients_df.empty else {}
 category_map = dict(zip(categories_df["category_name"], categories_df["category_id"])) if not categories_df.empty else {}
 
-tab_sales, tab_fleet, tab_procure, tab_debts, tab_comm, tab_expenses, tab_master, tab_reports = st.tabs([
-    "1. Sales", "2. Fleet", "3. Procurement", "4. Debts", "5. Commissions", "6. Expenses", "7. Master Setup", "8. Reports"
-])
+_tab_names = ["1. Sales", "2. Fleet", "3. Procurement", "4. Debts", "5. Commissions", "6. Expenses", "7. Master Setup", "8. Reports"]
+if is_admin: _tab_names.append("9. User Access")
+_tabs = st.tabs(_tab_names)
+tab_sales, tab_fleet, tab_procure, tab_debts, tab_comm, tab_expenses, tab_master, tab_reports = _tabs[:8]
+tab_users = _tabs[8] if is_admin else None
 
 # =============================================================================
 # TAB 1: SALES
@@ -538,6 +603,8 @@ with tab_fleet:
                     elif variance > 0: st.error(f"🚨 VARIANCE: {variance} units MISSING (Value: UGX {variance * set_price:,.2f})")
                     else: st.warning(f"⚠️ SURPLUS: {abs(variance)} units extra.")
                     st.rerun()
+                except Exception as e:
+                    conn.rollback(); st.error(VIEW_ONLY_MSG if isinstance(e, psycopg2.errors.ReadOnlySqlTransaction) else f"DB Error: {e}")
                 finally: conn.close()
 
     st.divider()
@@ -1210,6 +1277,26 @@ with tab_reports:
                    "Sales are counted by sale date and purchases by purchase date, so a later recovery or payment is not counted twice.")
     else:
         st.warning("Please select both a start and end date to generate the report.")
+
+# =============================================================================
+# TAB 9: USER ACCESS (admin only)
+# =============================================================================
+if tab_users is not None:
+    with tab_users:
+        st.subheader("User Access")
+        st.caption("Viewer: can only look. Editor: can add, edit and delete records. Admin: editor, plus manages this page. New registrations start as viewers.")
+        users_df = run_query("SELECT user_id, username, full_name, role FROM users ORDER BY user_id", fetch=True)
+        if isinstance(users_df, pd.DataFrame) and not users_df.empty:
+            st.dataframe(users_df, use_container_width=True)
+            c1, c2 = st.columns(2)
+            with c1: target_user = st.selectbox("User", users_df["username"].tolist(), key="role_user")
+            with c2: new_role = st.selectbox("New Access Level", ["viewer", "editor", "admin"], key="role_new")
+            if st.button("Update Access"):
+                if target_user == st.session_state.get("username") and new_role != "admin":
+                    st.error("You cannot remove your own admin access. Ask another admin, or make someone else admin first.")
+                else:
+                    run_query("UPDATE users SET role = %s WHERE username = %s", (new_role, target_user))
+                    st.success(f"{target_user} is now: {new_role}"); st.rerun()
 
 # A run that reached the end did not rerun, so any error was already shown above; don't repeat it
 st.session_state.pop("flash_transient", None)
