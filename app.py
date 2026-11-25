@@ -37,9 +37,16 @@ st.markdown("""
 # =============================================================================
 # 2. DB HELPERS
 # =============================================================================
-DB_CONFIG = {"host": "localhost", "port": "5432", "database": "enterprise_blueprint", "user": "postgres", "password": "African@5671"}
+def get_secret_db_url():
+    """Neon connection URL from Streamlit secrets ([postgres] url = "...") when deployed; None when running locally."""
+    try: return st.secrets["postgres"]["url"]
+    except Exception: return None
 
-def get_connection(): return psycopg2.connect(**DB_CONFIG)
+def get_connection():
+    url = get_secret_db_url()
+    if url: return psycopg2.connect(url)
+    # Local fallback. The password is read from the DB_PASSWORD environment variable, not stored in the code.
+    return psycopg2.connect(host="localhost", port="5432", database="enterprise_blueprint", user="postgres", password=os.environ.get("DB_PASSWORD", ""))
 
 def report_invalid_numbers():
     """Show the error now, and again after any st.rerun() (the script end clears it if no rerun happened)."""
