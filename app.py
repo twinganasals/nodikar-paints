@@ -37,12 +37,9 @@ st.markdown("""
 # =============================================================================
 # 2. DB HELPERS
 # =============================================================================
-def get_connection(): 
-    # Use the Neon URL from Streamlit secrets if deployed, otherwise fallback to local
-    if "postgres" in st.secrets:
-        return psycopg2.connect(st.secrets["postgres"]["url"])
-    else:
-        return psycopg2.connect(host="localhost", port="5432", database="enterprise_blueprint", user="postgres", password="African@5671")
+DB_CONFIG = {"host": "localhost", "port": "5432", "database": "enterprise_blueprint", "user": "postgres", "password": "African@5671"}
+
+def get_connection(): return psycopg2.connect(**DB_CONFIG)
 
 def report_invalid_numbers():
     """Show the error now, and again after any st.rerun() (the script end clears it if no rerun happened)."""
@@ -385,11 +382,14 @@ with tab_sales:
                 st.error("Prices and amounts cannot be negative.")
             elif item_map and agent_map:
                 total_amount = qty_sold * actual_price
+                # Not a credit sale and no client: a blank "Amount Paid" means the sale was paid in full
+                if not amount_paid_txt.strip() and not sell_on_credit and selected_client == "None":
+                    amount_paid = total_amount
                 balance = total_amount - amount_paid
                 if amount_paid > total_amount:
                     st.error("Amount paid cannot be more than the sale total.")
-                elif balance > 0 and selected_client == "None":
-                    st.error(f"This sale has an unpaid balance of UGX {balance:,.2f}. Select the client who owes it (or enter the full amount paid).")
+                elif balance > 0 and sell_on_credit and selected_client == "None":
+                    st.error(f"This is a credit sale with an unpaid balance of UGX {balance:,.2f}. Select the client who owes it.")
                 else:
                     status = "Paid" if balance <= 0 else ("Partial" if amount_paid > 0 else "Unpaid")
 
@@ -408,11 +408,13 @@ with tab_sales:
                                       (new_sale_id, int(agent_map[selected_agent]), int(item_map[selected_item]), set_price, actual_price, qty_sold, comm_val, sale_date))
                             log_commission_expense(new_comm_id, comm_val, sale_date, f"Commission: {selected_agent}, {selected_item} (Sale ID {new_sale_id})")
 
-                        if balance > 0 and selected_client != "None":
-                            debt_id = generate_debt_id(selected_client)
+                        if balance > 0:
+                            # Unpaid balance is tracked in Debts: against the client if one was chosen, otherwise against the agent
+                            who = selected_client if selected_client != "None" else selected_agent
+                            debt_id = generate_debt_id(who)
                             run_query("INSERT INTO agent_debts (agent_id, debt_date, reason, amount_owed, client_name) VALUES (%s, %s, %s, %s, %s)",
                                       (int(agent_map[selected_agent]), sale_date, f"Unpaid bal for {selected_item} (Sale ID {new_sale_id})", balance, debt_id))
-                            flash("warning", f"Client Debt Logged! ID: {debt_id} | Balance: UGX {balance:,.2f}")
+                            flash("warning", f"{'Client' if selected_client != 'None' else 'Agent'} debt logged! ID: {debt_id} | Balance: UGX {balance:,.2f}")
 
                         flash("success", f"Sale saved! Total UGX {total_amount:,.2f}"); st.rerun()
 
