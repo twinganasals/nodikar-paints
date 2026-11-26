@@ -92,12 +92,16 @@ def collect_data(conn, day):
             "credit_issued": sum(c["credit_issued"] for c in channels),
         }
 
-        # Money recovered today from earlier credit sales / other debts
-        data["recoveries_received_today"] = (
-            scalar(cur, """SELECT COALESCE(SUM(sp.amount), 0) FROM sale_payments sp
-                           JOIN sales_ledger s ON s.sale_id = sp.sale_id
-                           WHERE sp.payment_date = %s AND s.sale_date < %s""", (day, day))
-            + scalar(cur, "SELECT COALESCE(SUM(amount), 0) FROM debt_recoveries WHERE recovery_date = %s", (day,)))
+        # Money recovered today from earlier credit sales / other debts. Negative entries are corrections
+        # (someone edited an earlier payment or recovery downwards), reported separately so they are not mistaken for recoveries.
+        cur.execute("""SELECT COALESCE(SUM(CASE WHEN amt > 0 THEN amt END), 0), COALESCE(SUM(CASE WHEN amt < 0 THEN amt END), 0) FROM (
+                           SELECT sp.amount AS amt FROM sale_payments sp JOIN sales_ledger s ON s.sale_id = sp.sale_id
+                           WHERE sp.payment_date = %s AND s.sale_date < %s
+                           UNION ALL
+                           SELECT amount AS amt FROM debt_recoveries WHERE recovery_date = %s) t""", (day, day, day))
+        rec_pos, rec_neg = cur.fetchone()
+        data["recoveries_received_today"] = num(rec_pos)
+        data["corrections_to_earlier_payments_today"] = num(rec_neg)  # negative number, 0 if none
 
         # Truck variances (missing / surplus stock) from today's reconciliations
         data["fleet_runs_reconciled_today"] = int(scalar(cur, """
@@ -162,6 +166,7 @@ SYSTEM_PROMPT = (
     "'UGX 1,234,000'. Each bullet starts with '• ' and is one or two short sentences. If a truck variance has positive "
     "units, those units are missing; negative means surplus. If raw materials are 'not tracked in the database', do not "
     "mention reorders. If no truck reconciliation was done today, say so. If there were no sales, say so plainly. "
+    "'corrections_to_earlier_payments_today' is a negative number when earlier payments were edited downwards; mention it briefly if not zero. "
     "Plain text only (no markdown, no asterisks, no headings). Keep the whole reply under 800 characters."
 )
 
@@ -171,6 +176,8 @@ def fallback_summary(data):
     t = data["sales_total"]
     lines = [f"• Sales: {ugx(t['invoiced'])} invoiced; {ugx(t['cash_collected'])} collected, "
              f"{ugx(t['credit_issued'])} on credit. Recoveries received today: {ugx(data['recoveries_received_today'])}."]
+    if data["corrections_to_earlier_payments_today"]:
+        lines[0] += f" Corrections to earlier payments: {ugx(data['corrections_to_earlier_payments_today'])}."
     if data["truck_variances"]:
         v = data["truck_variances"][0]
         kind = "missing" if v["units"] > 0 else "surplus"
