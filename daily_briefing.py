@@ -6,15 +6,19 @@ Runs once a day (see daily_briefing.yml):
   2. asks Claude to write a short plain-English audit from those numbers,
   3. sends it to WhatsApp (WhatsApp Business Cloud API).
 
-Settings come from environment variables (GitHub "Secrets"):
+Settings come from environment variables (GitHub "Secrets").
+
+FREE setup (no paid services):
   NEON_DATABASE_URL        postgresql://user:password@host/dbname?sslmode=require
-  ANTHROPIC_API_KEY        key from console.anthropic.com
-  WHATSAPP_TOKEN           permanent access token from Meta (System User)
-  WHATSAPP_PHONE_NUMBER_ID the sender's Phone Number ID from Meta
-  WHATSAPP_TO              your number, international format, digits only, e.g. 2567XXXXXXXX
-                           (several numbers can be separated by commas)
-Optional:
-  WHATSAPP_TEMPLATE        approved template name (needed for automatic messages, see README notes)
+  TELEGRAM_BOT_TOKEN       token from Telegram's @BotFather
+  TELEGRAM_CHAT_ID         your chat id (several can be separated by commas)
+  (no ANTHROPIC_API_KEY: the summary is then written by the script itself, at no cost)
+
+Optional upgrades:
+  ANTHROPIC_API_KEY        if set, Claude writes the audit text (paid API)
+  CALLMEBOT_APIKEY + WHATSAPP_TO                 free WhatsApp via CallMeBot instead of Telegram
+  WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, WHATSAPP_TO   official Meta WhatsApp Business API
+  WHATSAPP_TEMPLATE        approved template name (Meta API only)
   WHATSAPP_TEMPLATE_LANG   template language code, default "en"
   ANTHROPIC_MODEL          default "claude-haiku-5-5"
   REPORT_DATE              YYYY-MM-DD, to re-run a past day (default: today in Kampala)
@@ -210,7 +214,50 @@ def build_whatsapp_payload(to, message, template=None, lang="en"):
     return {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": message}}
 
 
+def send_callmebot(message):
+    """Free WhatsApp delivery through the CallMeBot service (personal use)."""
+    apikey = env("CALLMEBOT_APIKEY", required=True)
+    recipients = [n.strip() for n in env("WHATSAPP_TO", required=True).split(",") if n.strip()]
+    failed = False
+    for to in recipients:
+        r = requests.get("https://api.callmebot.com/whatsapp.php",
+                         params={"phone": "+" + to.lstrip("+"), "text": message, "apikey": apikey}, timeout=60)
+        reply = " ".join(r.text.split())[:200]
+        if r.ok and "error" not in reply.lower():
+            print(f"Sent to {to}: {reply}")
+        else:
+            failed = True
+            print(f"CallMeBot error for {to}: {r.status_code} {reply}", file=sys.stderr)
+    if failed:
+        sys.exit(1)
+
+
+def send_telegram(message):
+    """Free delivery through a Telegram bot."""
+    token = env("TELEGRAM_BOT_TOKEN", required=True)
+    chats = [c.strip() for c in env("TELEGRAM_CHAT_ID", required=True).split(",") if c.strip()]
+    failed = False
+    for chat in chats:
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat, "text": message[:4000]}, timeout=30)
+        if r.ok and r.json().get("ok"):
+            print(f"Sent to Telegram chat {chat}")
+        else:
+            failed = True
+            print(f"Telegram error for chat {chat}: {r.status_code} {r.text[:300]}", file=sys.stderr)
+    if failed:
+        sys.exit(1)
+
+
+def send_message(message):
+    if env("TELEGRAM_BOT_TOKEN"):
+        return send_telegram(message)
+    return send_whatsapp(message)
+
+
 def send_whatsapp(message):
+    if env("CALLMEBOT_APIKEY"):
+        return send_callmebot(message)
     token = env("WHATSAPP_TOKEN", required=True)
     phone_id = env("WHATSAPP_PHONE_NUMBER_ID", required=True)
     recipients = [n.strip() for n in env("WHATSAPP_TO", required=True).split(",") if n.strip()]
@@ -239,13 +286,17 @@ def main():
     finally:
         conn.close()
 
-    try:
-        body = ask_ai(data, env("ANTHROPIC_API_KEY", required=True))
-        if not body:
-            raise ValueError("empty AI reply")
-    except Exception as e:  # still deliver the numbers if the AI is unavailable
-        print(f"AI step failed ({e}); using plain summary.", file=sys.stderr)
-        body = fallback_summary(data)
+    api_key = env("ANTHROPIC_API_KEY")
+    if api_key:
+        try:
+            body = ask_ai(data, api_key)
+            if not body:
+                raise ValueError("empty AI reply")
+        except Exception as e:  # still deliver the numbers if the AI is unavailable
+            print(f"AI step failed ({e}); using plain summary.", file=sys.stderr)
+            body = fallback_summary(data)
+    else:
+        body = fallback_summary(data)  # free mode: no AI service needed
 
     message = f"Nodikar Paints — Daily Audit ({day:%d %b %Y})\n{body}"
     if env("DRY_RUN") == "1":
@@ -254,7 +305,7 @@ def main():
         print("---- data used ----")
         print(json.dumps(data, indent=1))
     else:
-        send_whatsapp(message)
+        send_message(message)
 
 
 if __name__ == "__main__":
