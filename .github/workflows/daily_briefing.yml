@@ -1,0 +1,34 @@
+# Save this file in your repository as:  .github/workflows/daily_briefing.yml
+name: Evening Director's Briefing
+
+on:
+  schedule:
+    # GitHub uses UTC. 16:30 UTC = 19:30 (7:30 PM) in Kampala (UTC+3, no daylight saving).
+    - cron: "30 16 * * *"
+  workflow_dispatch:            # lets you run it by hand from the Actions tab to test
+    inputs:
+      dry_run:
+        description: "Test mode: print the message instead of sending it"
+        type: boolean
+        default: true
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install psycopg2-binary requests
+      - run: python daily_briefing.py
+        env:
+          NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          WHATSAPP_TOKEN: ${{ secrets.WHATSAPP_TOKEN }}
+          WHATSAPP_PHONE_NUMBER_ID: ${{ secrets.WHATSAPP_PHONE_NUMBER_ID }}
+          WHATSAPP_TO: ${{ secrets.WHATSAPP_TO }}
+          WHATSAPP_TEMPLATE: ${{ secrets.WHATSAPP_TEMPLATE }}
+          # Scheduled runs always send; manual runs are a dry run unless you untick the box
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
