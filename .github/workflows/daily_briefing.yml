@@ -1,16 +1,23 @@
 # Save this file in your repository as:  .github/workflows/daily_briefing.yml
-name: Evening Director's Briefing
+name: Evening Director's Briefing   # also runs the Sunday weekly report
 
 on:
   schedule:
     # GitHub uses UTC. 16:00 UTC = 19:00 (7:00 PM) in Kampala (UTC+3, no daylight saving).
-    - cron: "0 16 * * *"
+    - cron: "0 16 * * *"      # every day 7:00 PM Kampala  -> daily audit
+    # 07:00 UTC = 10:00 AM Kampala (UTC+3). Day 0 = Sunday  -> weekly report
+    - cron: "0 7 * * 0"
   workflow_dispatch:            # lets you run it by hand from the Actions tab to test
     inputs:
       dry_run:
         description: "Test mode: print the message instead of sending it"
         type: boolean
         default: true
+      report_type:
+        description: "Which report to run"
+        type: choice
+        options: [daily, weekly]
+        default: daily
 
 jobs:
   briefing:
@@ -34,4 +41,6 @@ jobs:
           WHATSAPP_TO: ${{ secrets.WHATSAPP_TO }}
           WHATSAPP_TEMPLATE: ${{ secrets.WHATSAPP_TEMPLATE }}
           # Scheduled runs always send; manual runs are a dry run unless you untick the box
+          # Sunday 10 AM schedule = weekly; every other schedule = daily; manual runs use the box you choose
+          REPORT_TYPE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.report_type || (github.event.schedule == '0 7 * * 0' && 'weekly' || 'daily') }}
           DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
