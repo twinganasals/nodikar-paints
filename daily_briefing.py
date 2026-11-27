@@ -1,7 +1,12 @@
 """
 Nodikar Paints - Automated Evening Director's Briefing
 
-Runs once a day (see daily_briefing.yml):
+Two reports share this script (see daily_briefing.yml):
+  daily  - every evening, about today's numbers
+  weekly - every Sunday morning, about the 7 days before (Sunday to Saturday), compared with the week before
+  Choose with the REPORT_TYPE setting ("daily" is the default).
+
+Each run:
   1. reads today's numbers from the Neon database (read-only),
   2. asks Claude to write a short plain-English audit from those numbers,
   3. sends it to WhatsApp (WhatsApp Business Cloud API).
@@ -21,7 +26,9 @@ Optional upgrades:
   WHATSAPP_TEMPLATE        approved template name (Meta API only)
   WHATSAPP_TEMPLATE_LANG   template language code, default "en"
   ANTHROPIC_MODEL          default "claude-haiku-5-5"
-  REPORT_DATE              YYYY-MM-DD, to re-run a past day (default: today in Kampala)
+  REPORT_TYPE              "daily" (default) or "weekly"
+  REPORT_DATE              YYYY-MM-DD, to re-run a past day; for weekly, the LAST day of the week to report
+                           (default: today in Kampala; for weekly, yesterday)
   DRY_RUN                  "1" = print the message instead of sending it
 """
 import os
@@ -196,16 +203,157 @@ def fallback_summary(data):
     return "\n".join(lines)
 
 
-def ask_ai(data, api_key):
+def ask_ai(data, api_key, system_prompt=None):
     resp = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
         json={"model": env("ANTHROPIC_MODEL", "claude-haiku-5-5"), "max_tokens": 600, "temperature": 0.2,
-              "system": SYSTEM_PROMPT,
-              "messages": [{"role": "user", "content": "Today's data (JSON):\n" + json.dumps(data, indent=1)}]},
+              "system": system_prompt or SYSTEM_PROMPT,
+              "messages": [{"role": "user", "content": "Data (JSON):\n" + json.dumps(data, indent=1)}]},
         timeout=60)
     resp.raise_for_status()
     return "".join(b.get("text", "") for b in resp.json()["content"] if b.get("type") == "text").strip()
+
+
+
+# --------------------------------------------------------------------------- weekly report
+def week_totals(cur, start, end):
+    """Headline totals for a date range (used for this week and the week before)."""
+    t = {"invoiced": scalar(cur, "SELECT COALESCE(SUM(quantity_sold * actual_price), 0) FROM sales_ledger "
+                                 "WHERE sale_date BETWEEN %s AND %s", (start, end))}
+    t["cash_received"] = (
+        scalar(cur, """SELECT COALESCE(SUM(sp.amount), 0) FROM sale_payments sp JOIN sales_ledger s ON s.sale_id = sp.sale_id
+                       WHERE sp.payment_date BETWEEN %s AND %s""", (start, end))
+        + scalar(cur, """SELECT COALESCE(SUM(dr.amount), 0) FROM debt_recoveries dr JOIN agent_debts d ON d.debt_id::text = dr.debt_id
+                         WHERE dr.recovery_date BETWEEN %s AND %s""", (start, end)))
+    t["total_expenses"] = (
+        scalar(cur, """SELECT COALESCE(SUM(financial_amount), 0) FROM enterprise_ledger
+                       WHERE accounting_date BETWEEN %s AND %s AND entry_type = 'Outflow'
+                         AND COALESCE(source_reference_table, '') <> 'procurement'""", (start, end))
+        + scalar(cur, """SELECT COALESCE(SUM(pp.amount), 0) FROM purchase_payments pp JOIN purchases p ON p.purchase_id = pp.purchase_id
+                         WHERE pp.payment_date BETWEEN %s AND %s""", (start, end)))
+    t["net_cash_flow"] = t["cash_received"] - t["total_expenses"]
+    return t
+
+
+def collect_weekly(conn, start, end):
+    data = {"period_start": start.isoformat(), "period_end": end.isoformat()}
+    with conn.cursor() as cur:
+        data["this_week"] = week_totals(cur, start, end)
+        data["previous_week"] = week_totals(cur, start - dt.timedelta(days=7), end - dt.timedelta(days=7))
+
+        # Sales by channel: invoiced vs cash collected vs credit issued
+        rows = fetch(cur, """
+            SELECT s.sales_channel,
+                   COALESCE(SUM(s.quantity_sold * s.actual_price), 0) AS invoiced,
+                   COALESCE(SUM(p.paid), 0) AS cash_collected
+            FROM sales_ledger s
+            LEFT JOIN (SELECT sale_id, SUM(amount) AS paid FROM sale_payments
+                       WHERE payment_date <= %s GROUP BY sale_id) p ON p.sale_id = s.sale_id
+            WHERE s.sale_date BETWEEN %s AND %s
+            GROUP BY s.sales_channel ORDER BY 2 DESC""", (end, start, end))
+        data["sales_by_channel"] = [
+            {"channel": r["sales_channel"], "invoiced": num(r["invoiced"]), "cash_collected": num(r["cash_collected"]),
+             "credit_issued": max(num(r["invoiced"]) - num(r["cash_collected"]), 0.0)} for r in rows]
+        data["credit_issued_total"] = sum(c["credit_issued"] for c in data["sales_by_channel"])
+
+        data["top_agents"] = [{"agent": r["agent_name"], "invoiced": num(r["invoiced"])} for r in fetch(cur, """
+            SELECT a.agent_name, SUM(s.quantity_sold * s.actual_price) AS invoiced
+            FROM sales_ledger s JOIN agents a ON a.agent_id = s.agent_id
+            WHERE s.sale_date BETWEEN %s AND %s GROUP BY a.agent_name ORDER BY 2 DESC LIMIT 5""", (start, end))]
+        data["top_items"] = [{"item": r["item_name"], "units": num(r["units"]), "invoiced": num(r["invoiced"])} for r in fetch(cur, """
+            SELECT i.item_name, SUM(s.quantity_sold) AS units, SUM(s.quantity_sold * s.actual_price) AS invoiced
+            FROM sales_ledger s JOIN inventory_items i ON i.item_id = s.item_id
+            WHERE s.sale_date BETWEEN %s AND %s GROUP BY i.item_name ORDER BY 3 DESC LIMIT 5""", (start, end))]
+
+        # Expenses
+        data["expenses_by_category"] = [{"category": r["category"], "total": num(r["total"])} for r in fetch(cur, """
+            SELECT COALESCE(c.category_name, 'Uncategorised') AS category, SUM(e.financial_amount) AS total
+            FROM enterprise_ledger e LEFT JOIN general_expenditure_categories c ON c.category_id = e.category_id
+            WHERE e.accounting_date BETWEEN %s AND %s AND e.entry_type = 'Outflow'
+              AND COALESCE(e.source_reference_table, '') NOT IN ('commission', 'procurement')
+            GROUP BY 1 ORDER BY 2 DESC LIMIT 6""", (start, end))]
+        data["commissions_total"] = scalar(cur, """SELECT COALESCE(SUM(financial_amount), 0) FROM enterprise_ledger
+            WHERE accounting_date BETWEEN %s AND %s AND entry_type = 'Outflow' AND source_reference_table = 'commission'""", (start, end))
+        data["supplier_payments_total"] = scalar(cur, """SELECT COALESCE(SUM(pp.amount), 0) FROM purchase_payments pp
+            JOIN purchases p ON p.purchase_id = pp.purchase_id WHERE pp.payment_date BETWEEN %s AND %s""", (start, end))
+
+        # Truck variances by truck (positive units = missing, negative = surplus)
+        trucks = fetch(cur, """
+            SELECT vehicle_color, COUNT(*) AS loads,
+                   SUM(CASE WHEN variance_units <> 0 THEN 1 ELSE 0 END) AS loads_with_variance,
+                   SUM(variance_units) AS net_units,
+                   SUM(CASE WHEN variance_units > 0 THEN variance_units * set_price ELSE 0 END) AS missing_value
+            FROM (
+                SELECT v.vehicle_color, l.set_price,
+                       (l.opening_stock + l.added_items - l.physical_final_stock) - l.agent_registered_sold AS variance_units
+                FROM daily_run_loading l
+                JOIN fleet_daily_runs r ON l.run_id = r.run_id
+                JOIN vehicles v ON v.vehicle_id = r.vehicle_id
+                WHERE r.run_date BETWEEN %s AND %s
+            ) t GROUP BY vehicle_color ORDER BY missing_value DESC""", (start, end))
+        data["trucks"] = [{"truck": r["vehicle_color"], "loads": int(num(r["loads"])), "loads_with_variance": int(num(r["loads_with_variance"])),
+                           "net_units_missing": num(r["net_units"]), "missing_value": num(r["missing_value"])} for r in trucks]
+
+        # Debts
+        data["debts"] = {
+            "outstanding_total": scalar(cur, "SELECT COALESCE(SUM(amount_owed - amount_recovered), 0) FROM agent_debts WHERE status != 'Cleared'"),
+            "new_debts_this_week": scalar(cur, "SELECT COALESCE(SUM(amount_owed), 0) FROM agent_debts WHERE debt_date BETWEEN %s AND %s", (start, end)),
+            "top_debtors": [{"name": r["who"], "agent": r["agent_name"], "balance": num(r["balance"])} for r in fetch(cur, """
+                SELECT COALESCE(d.client_name, 'n/a') AS who, a.agent_name, SUM(d.amount_owed - d.amount_recovered) AS balance
+                FROM agent_debts d JOIN agents a ON a.agent_id = d.agent_id WHERE d.status != 'Cleared'
+                GROUP BY 1, 2 ORDER BY 3 DESC LIMIT 5""")],
+            "owed_to_suppliers": scalar(cur, """SELECT COALESCE(SUM(p.total_payout - COALESCE(pp.paid, 0)), 0) FROM purchases p
+                LEFT JOIN (SELECT purchase_id, SUM(amount) AS paid FROM purchase_payments GROUP BY purchase_id) pp
+                ON pp.purchase_id = p.purchase_id""")}
+    return data
+
+
+WEEKLY_SYSTEM_PROMPT = (
+    "Act as the Financial Auditor for Nodikar Paints, a paint company in Uganda. Write the Director's weekly report as "
+    "6 short bullet points covering: (1) sales and how much was collected versus given on credit, (2) this week compared "
+    "with the previous week for sales, cash received and expenses, (3) expenses and commissions, (4) truck shortages by "
+    "truck, (5) debts owed to the company and to suppliers, and (6) one clear recommended action for next week.\n"
+    "Rules: use ONLY the numbers in the data given; never invent figures. You may calculate simple percentage changes "
+    "from the numbers given. Write amounts as 'UGX 1,234,000'. Each bullet starts with '• ' and is one or two short "
+    "sentences. For trucks, positive units are missing and negative are surplus; if there were no truck loads, say so. "
+    "Plain text only (no markdown, no asterisks, no headings). Keep the whole reply under 1400 characters."
+)
+
+
+def pct_change(now, before):
+    if not before:
+        return "n/a" if not now else "new"
+    return f"{(now - before) / before * 100:+.0f}%"
+
+
+def weekly_fallback_summary(d):
+    """Plain weekly summary built without AI."""
+    t, p = d["this_week"], d["previous_week"]
+    credit = d["credit_issued_total"]
+    lines = [
+        f"• Sales: {ugx(t['invoiced'])} invoiced ({pct_change(t['invoiced'], p['invoiced'])} vs previous week); "
+        f"{ugx(credit)} of it on credit.",
+        f"• Cash received: {ugx(t['cash_received'])} ({pct_change(t['cash_received'], p['cash_received'])} vs previous week).",
+        f"• Expenses: {ugx(t['total_expenses'])} ({pct_change(t['total_expenses'], p['total_expenses'])}), including "
+        f"commissions {ugx(d['commissions_total'])} and supplier payments {ugx(d['supplier_payments_total'])}. "
+        f"Net cash flow: {ugx(t['net_cash_flow'])}.",
+    ]
+    bad = [x for x in d["trucks"] if x["missing_value"] > 0]
+    if bad:
+        lines.append("• Fleet: " + "; ".join(f"{x['truck']} truck {x['net_units_missing']:g} units short ({ugx(x['missing_value'])})"
+                                             for x in bad[:3]) + ".")
+    elif d["trucks"]:
+        lines.append("• Fleet: no missing stock on any truck this week.")
+    else:
+        lines.append("• Fleet: no truck loads were recorded this week.")
+    db = d["debts"]
+    lines.append(f"• Debts: {ugx(db['outstanding_total'])} owed to the company (new this week: {ugx(db['new_debts_this_week'])}); "
+                 f"{ugx(db['owed_to_suppliers'])} owed to suppliers.")
+    if d["top_agents"]:
+        a = d["top_agents"][0]
+        lines.append(f"• Top agent: {a['agent']} with {ugx(a['invoiced'])} in sales.")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- 3. WhatsApp
@@ -284,28 +432,38 @@ def send_whatsapp(message):
 
 # --------------------------------------------------------------------------- main
 def main():
-    day = dt.date.fromisoformat(env("REPORT_DATE")) if env("REPORT_DATE") else dt.datetime.now(TZ).date()
+    weekly_mode = (env("REPORT_TYPE", "daily") or "daily").lower() == "weekly"
+    today = dt.datetime.now(TZ).date()
+    if weekly_mode:
+        end = dt.date.fromisoformat(env("REPORT_DATE")) if env("REPORT_DATE") else today - dt.timedelta(days=1)
+        start = end - dt.timedelta(days=6)
+        title = f"Nodikar Paints — Weekly Report ({start:%d %b} – {end:%d %b %Y})"
+        collect, prompt, fallback = (lambda c: collect_weekly(c, start, end)), WEEKLY_SYSTEM_PROMPT, weekly_fallback_summary
+    else:
+        day = dt.date.fromisoformat(env("REPORT_DATE")) if env("REPORT_DATE") else today
+        title = f"Nodikar Paints — Daily Audit ({day:%d %b %Y})"
+        collect, prompt, fallback = (lambda c: collect_data(c, day)), SYSTEM_PROMPT, fallback_summary
 
     conn = psycopg2.connect(env("NEON_DATABASE_URL", required=True), connect_timeout=30)
     conn.set_session(readonly=True)  # this script can never change your data
     try:
-        data = collect_data(conn, day)
+        data = collect(conn)
     finally:
         conn.close()
 
     api_key = env("ANTHROPIC_API_KEY")
     if api_key:
         try:
-            body = ask_ai(data, api_key)
+            body = ask_ai(data, api_key, prompt)
             if not body:
                 raise ValueError("empty AI reply")
         except Exception as e:  # still deliver the numbers if the AI is unavailable
             print(f"AI step failed ({e}); using plain summary.", file=sys.stderr)
-            body = fallback_summary(data)
+            body = fallback(data)
     else:
-        body = fallback_summary(data)  # free mode: no AI service needed
+        body = fallback(data)  # free mode: no AI service needed
 
-    message = f"Nodikar Paints — Daily Audit ({day:%d %b %Y})\n{body}"
+    message = f"{title}\n{body}"
     if env("DRY_RUN") == "1":
         print("---- DRY RUN: message not sent ----")
         print(message)
