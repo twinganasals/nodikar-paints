@@ -3,8 +3,8 @@ name: Evening Director's Briefing
 
 on:
   schedule:
-    # GitHub uses UTC. 16:30 UTC = 19:30 (7:30 PM) in Kampala (UTC+3, no daylight saving).
-    - cron: "30 16 * * *"
+    # GitHub uses UTC. 16:00 UTC = 19:00 (7:00 PM) in Kampala (UTC+3, no daylight saving).
+    - cron: "0 16 * * *"
   workflow_dispatch:            # lets you run it by hand from the Actions tab to test
     inputs:
       dry_run:
