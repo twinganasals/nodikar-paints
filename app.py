@@ -1,7 +1,8 @@
 import streamlit as st
 import psycopg2
 import pandas as pd
-from datetime import date
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 import os
 import hashlib
 import random
@@ -9,6 +10,12 @@ import ast
 import operator
 import json
 import streamlit.components.v1 as components
+try:
+    import plotly.graph_objects as go
+    PLOTLY_OK = True
+except ImportError:          # the app keeps working; the Dashboard tab explains what to install
+    go = None
+    PLOTLY_OK = False
 from contextlib import contextmanager
 
 # =============================================================================
@@ -301,6 +308,106 @@ def ensure_payment_tables():
                  WHERE p.status = 'Cleared' AND COALESCE(p.total_payout, 0) > 0
                    AND NOT EXISTS (SELECT 1 FROM purchase_payments pp WHERE pp.purchase_id = p.purchase_id)""")
 
+# ===== DASHBOARD HELPERS START =====
+CHART_GREEN, CHART_RED, CHART_BLUE, CHART_AMBER = "#10b981", "#ef4444", "#3b82f6", "#f59e0b"
+PIE_COLORS = ["#f59e0b", "#3b82f6", "#10b981", "#ef4444", "#8b5cf6", "#06b6d4", "#ec4899", "#84cc16", "#94a3b8"]
+
+def style_fig(fig, title, height=420):
+    """One consistent dark, transparent look that matches the app."""
+    fig.update_layout(
+        title=dict(text=title, x=0, font=dict(size=18)), template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color="#e2e8f0"),
+        height=height, margin=dict(l=10, r=10, t=70, b=10),
+        hoverlabel=dict(bgcolor="#1e293b", font_color="#f8fafc"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+    fig.update_xaxes(gridcolor="rgba(148,163,184,0.15)", zeroline=False)
+    fig.update_yaxes(gridcolor="rgba(148,163,184,0.15)", zeroline=False)
+    return fig
+
+def load_cash_series(start, end):
+    """Cash received and cash paid out, by day (same rules as the Reports tab)."""
+    cash_in = run_query("""SELECT d, SUM(amt) AS amt FROM (
+            SELECT sp.payment_date AS d, sp.amount AS amt FROM sale_payments sp JOIN sales_ledger s ON s.sale_id = sp.sale_id
+            WHERE sp.payment_date >= %s AND sp.payment_date <= %s
+            UNION ALL
+            SELECT dr.recovery_date AS d, dr.amount AS amt FROM debt_recoveries dr JOIN agent_debts ad ON ad.debt_id::text = dr.debt_id
+            WHERE dr.recovery_date >= %s AND dr.recovery_date <= %s) t GROUP BY d ORDER BY d""", (start, end, start, end), fetch=True)
+    cash_out = run_query("""SELECT d, SUM(amt) AS amt FROM (
+            SELECT accounting_date AS d, financial_amount AS amt FROM enterprise_ledger
+            WHERE accounting_date >= %s AND accounting_date <= %s AND entry_type = 'Outflow' AND COALESCE(source_reference_table, '') <> 'procurement'
+            UNION ALL
+            SELECT pp.payment_date AS d, pp.amount AS amt FROM purchase_payments pp JOIN purchases p ON p.purchase_id = pp.purchase_id
+            WHERE pp.payment_date >= %s AND pp.payment_date <= %s) t GROUP BY d ORDER BY d""", (start, end, start, end), fetch=True)
+    return cash_in, cash_out
+
+def build_daily_cashflow(cash_in_df, cash_out_df, start, end):
+    """One row per calendar day (days with no activity are 0)."""
+    days = pd.date_range(start, end, freq="D")
+    def series(df):
+        if not isinstance(df, pd.DataFrame) or df.empty: return pd.Series(0.0, index=days)
+        s_ = pd.Series(df["amt"].astype(float).values, index=pd.to_datetime(df["d"]))
+        return s_.groupby(level=0).sum().reindex(days, fill_value=0.0)
+    out = pd.DataFrame({"Cash received": series(cash_in_df), "Expenses paid": series(cash_out_df)})
+    out["Net cash flow"] = out["Cash received"] - out["Expenses paid"]
+    return out
+
+def cashflow_fig(daily, cumulative=False):
+    data = daily.cumsum() if cumulative else daily
+    fig = go.Figure()
+    for col, color, fill in (("Cash received", CHART_GREEN, None), ("Expenses paid", CHART_RED, None), ("Net cash flow", CHART_BLUE, "rgba(59,130,246,0.12)")):
+        fig.add_trace(go.Scatter(
+            x=data.index, y=data[col], name=col, mode="lines+markers" if len(data) <= 45 else "lines",
+            line=dict(color=color, width=3 if col == "Net cash flow" else 2), marker=dict(size=6),
+            fill="tozeroy" if fill else None, fillcolor=fill,
+            hovertemplate="%{x|%a %d %b}<br>" + col + ": UGX %{y:,.0f}<extra></extra>"))
+    fig.update_layout(hovermode="x unified")
+    fig.update_yaxes(tickformat=",.0f", title_text="UGX")
+    return style_fig(fig, "Cash flow, running total" if cumulative else "Cash flow, day by day")
+
+def products_fig(df, metric):
+    col = "units" if metric == "Units sold" else "value"
+    d = df[["item_name", col]].copy()
+    d[col] = d[col].astype(float)
+    d = d[d[col] > 0].sort_values(col, ascending=False)
+    if len(d) > 8:
+        other = d.iloc[7:][col].sum()
+        d = pd.concat([d.head(7), pd.DataFrame({"item_name": ["Other products"], col: [other]})], ignore_index=True)
+    fig = go.Figure(go.Pie(
+        labels=d["item_name"], values=d[col], hole=0.58, sort=False, textinfo="percent",
+        marker=dict(colors=PIE_COLORS[:len(d)], line=dict(color="#1e2229", width=2)),
+        hovertemplate="%{label}<br>%{value:,.0f}<br>%{percent}<extra></extra>"))
+    fig.add_annotation(text=f"<b>{d[col].sum():,.0f}</b><br>{'units' if col == 'units' else 'UGX'}", x=0.5, y=0.5, showarrow=False,
+                       font=dict(size=16, color="#f8fafc"))
+    style_fig(fig, "Best-selling products " + ("(units)" if col == "units" else "(sales value)"))
+    fig.update_layout(legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.02))
+    return fig
+
+def agents_fig(df):
+    d = df.copy()
+    d["collected"] = d["collected"].astype(float)
+    d["invoiced"] = d["invoiced"].astype(float)
+    d["credit"] = (d["invoiced"] - d["collected"]).clip(lower=0)
+    d = d.sort_values("collected")  # horizontal bars: the biggest ends up on top
+    fig = go.Figure()
+    fig.add_trace(go.Bar(y=d["agent_name"], x=d["collected"], orientation="h", name="Cash collected", marker_color=CHART_GREEN,
+                         hovertemplate="%{y}<br>Collected: UGX %{x:,.0f}<extra></extra>"))
+    fig.add_trace(go.Bar(y=d["agent_name"], x=d["credit"], orientation="h", name="Still on credit", marker_color=CHART_AMBER,
+                         hovertemplate="%{y}<br>On credit: UGX %{x:,.0f}<extra></extra>"))
+    fig.update_layout(barmode="stack")
+    fig.update_xaxes(tickformat=",.0f", title_text="UGX")
+    return style_fig(fig, "Agents: money brought in", height=max(320, 70 + 46 * len(d)))
+
+def expenses_fig(df):
+    d = df.copy()
+    d["total"] = d["total"].astype(float)
+    d = d[d["total"] > 0].sort_values("total")
+    fig = go.Figure(go.Bar(y=d["category"], x=d["total"], orientation="h", marker_color=CHART_RED,
+                           text=[f"{v:,.0f}" for v in d["total"]], textposition="outside", cliponaxis=False,
+                           hovertemplate="%{y}<br>UGX %{x:,.0f}<extra></extra>"))
+    fig.update_xaxes(tickformat=",.0f", title_text="UGX")
+    return style_fig(fig, "Where the money goes", height=max(320, 70 + 42 * len(d)))
+# ===== DASHBOARD HELPERS END =====
+
 def ensure_user_roles():
     """Adds a role to every user: 'viewer' (view only), 'editor' (can add/edit/delete) or 'admin' (editor + manages users).
     New registrations are viewers until an admin changes them. The admin is the username in secrets ([app] admin_username);
@@ -414,11 +521,11 @@ supplier_map = dict(zip(suppliers_df["supplier_name"], suppliers_df["supplier_id
 client_map = dict(zip(clients_df["client_name"], clients_df["client_id"])) if not clients_df.empty else {}
 category_map = dict(zip(categories_df["category_name"], categories_df["category_id"])) if not categories_df.empty else {}
 
-_tab_names = ["1. Sales", "2. Fleet", "3. Procurement", "4. Debts", "5. Commissions", "6. Expenses", "7. Master Setup", "8. Reports"]
-if is_admin: _tab_names.append("9. User Access")
+_tab_names = ["1. Sales", "2. Fleet", "3. Procurement", "4. Debts", "5. Commissions", "6. Expenses", "7. Master Setup", "8. Reports", "9. Dashboard"]
+if is_admin: _tab_names.append("10. User Access")
 _tabs = st.tabs(_tab_names)
-tab_sales, tab_fleet, tab_procure, tab_debts, tab_comm, tab_expenses, tab_master, tab_reports = _tabs[:8]
-tab_users = _tabs[8] if is_admin else None
+tab_sales, tab_fleet, tab_procure, tab_debts, tab_comm, tab_expenses, tab_master, tab_reports, tab_dashboard = _tabs[:9]
+tab_users = _tabs[9] if is_admin else None
 
 # =============================================================================
 # TAB 1: SALES
@@ -1279,7 +1386,96 @@ with tab_reports:
         st.warning("Please select both a start and end date to generate the report.")
 
 # =============================================================================
-# TAB 9: USER ACCESS (admin only)
+# TAB 9: DIRECTOR'S DASHBOARD (visual analytics)
+# =============================================================================
+with tab_dashboard:
+    st.subheader("Director's Dashboard")
+    if not PLOTLY_OK:
+        st.warning("The charts need the 'plotly' package. Add a line containing just the word plotly to requirements.txt in GitHub, then reboot the app.")
+    else:
+        d_today = datetime.now(ZoneInfo("Africa/Kampala")).date()
+        dc1, dc2, dc3 = st.columns([2, 1, 1])
+        with dc1:
+            preset = st.selectbox("Period", ["Last 7 days", "Last 30 days", "Last 90 days", "This month", "Custom"], index=1, key="dash_preset")
+        if preset == "Custom":
+            with dc2: dash_start = st.date_input("From", value=d_today - timedelta(days=29), key="dash_from")
+            with dc3: dash_end = st.date_input("To", value=d_today, key="dash_to")
+        else:
+            dash_end = d_today
+            dash_start = {"Last 7 days": d_today - timedelta(days=6), "Last 30 days": d_today - timedelta(days=29),
+                          "Last 90 days": d_today - timedelta(days=89), "This month": d_today.replace(day=1)}[preset]
+
+        if not dash_start or not dash_end or dash_start > dash_end:
+            st.error("Choose a valid period: the start date must be on or before the end date.")
+        else:
+            n_days = (dash_end - dash_start).days + 1
+            prev_end = dash_start - timedelta(days=1)
+            prev_start = prev_end - timedelta(days=n_days - 1)
+
+            cin_df, cout_df = load_cash_series(dash_start, dash_end)
+            daily = build_daily_cashflow(cin_df, cout_df, dash_start, dash_end)
+            pin_df, pout_df = load_cash_series(prev_start, prev_end)
+            prev = build_daily_cashflow(pin_df, pout_df, prev_start, prev_end)
+
+            def delta_text(now, before):
+                return f"{(now - before) / before * 100:+.0f}% vs previous {n_days} days" if before else None
+
+            tot_in, tot_out = daily["Cash received"].sum(), daily["Expenses paid"].sum()
+            prev_in, prev_out = prev["Cash received"].sum(), prev["Expenses paid"].sum()
+            owed = scalar(run_query("SELECT SUM(amount_owed - amount_recovered) AS t FROM agent_debts WHERE status != 'Cleared'", fetch=True), 't')
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Cash received", f"UGX {tot_in:,.0f}", delta_text(tot_in, prev_in))
+            k2.metric("Expenses paid", f"UGX {tot_out:,.0f}", delta_text(tot_out, prev_out), delta_color="inverse")
+            k3.metric("Net cash flow", f"UGX {tot_in - tot_out:,.0f}", delta_text(tot_in - tot_out, prev_in - prev_out) if (prev_in - prev_out) > 0 else None)
+            k4.metric("Owed to the company", f"UGX {owed:,.0f}")
+            st.caption(f"{dash_start:%d %b %Y} to {dash_end:%d %b %Y}. Hover over any chart for exact figures; click a legend item to hide or show it.")
+
+            # 1. Cash flow line chart
+            cumulative = st.checkbox("Show running total instead of day by day", value=False, key="dash_cumulative")
+            if daily.abs().to_numpy().sum() == 0:
+                st.info("No cash movements in this period.")
+            else:
+                st.plotly_chart(cashflow_fig(daily, cumulative), use_container_width=True)
+
+            # 2 + 3. Best sellers and top agents
+            sales_start, sales_end = dash_start, dash_end
+            col_a, col_b = st.columns(2)
+            with col_a:
+                metric = st.radio("Best sellers by", ["Sales value", "Units sold"], horizontal=True, key="dash_metric")
+                prod_df = run_query("""SELECT i.item_name, SUM(s.quantity_sold) AS units, SUM(s.quantity_sold * s.actual_price) AS value
+                                       FROM sales_ledger s JOIN inventory_items i ON i.item_id = s.item_id
+                                       WHERE s.sale_date >= %s AND s.sale_date <= %s GROUP BY i.item_name ORDER BY value DESC""",
+                                    (sales_start, sales_end), fetch=True)
+                if isinstance(prod_df, pd.DataFrame) and not prod_df.empty:
+                    st.plotly_chart(products_fig(prod_df, metric), use_container_width=True)
+                else: st.info("No sales in this period.")
+            with col_b:
+                st.markdown("&nbsp;")
+                st.markdown("&nbsp;")
+                agent_df = run_query("""SELECT a.agent_name, SUM(s.quantity_sold * s.actual_price) AS invoiced, COALESCE(SUM(p.paid), 0) AS collected
+                                        FROM sales_ledger s JOIN agents a ON a.agent_id = s.agent_id
+                                        LEFT JOIN (SELECT sale_id, SUM(amount) AS paid FROM sale_payments GROUP BY sale_id) p ON p.sale_id = s.sale_id
+                                        WHERE s.sale_date >= %s AND s.sale_date <= %s GROUP BY a.agent_name ORDER BY collected DESC LIMIT 10""",
+                                     (sales_start, sales_end), fetch=True)
+                if isinstance(agent_df, pd.DataFrame) and not agent_df.empty:
+                    st.plotly_chart(agents_fig(agent_df), use_container_width=True)
+                else: st.info("No sales in this period.")
+
+            # 4. Expenses breakdown
+            exp_cat = run_query("""SELECT COALESCE(c.category_name, 'Uncategorised') AS category, SUM(e.financial_amount) AS total
+                                   FROM enterprise_ledger e LEFT JOIN general_expenditure_categories c ON c.category_id = e.category_id
+                                   WHERE e.accounting_date >= %s AND e.accounting_date <= %s AND e.entry_type = 'Outflow'
+                                     AND COALESCE(e.source_reference_table, '') <> 'procurement' GROUP BY 1""", (dash_start, dash_end), fetch=True)
+            sup_paid = scalar(run_query("""SELECT SUM(pp.amount) AS t FROM purchase_payments pp JOIN purchases p ON p.purchase_id = pp.purchase_id
+                                           WHERE pp.payment_date >= %s AND pp.payment_date <= %s""", (dash_start, dash_end), fetch=True), 't')
+            exp_df = exp_cat if isinstance(exp_cat, pd.DataFrame) else pd.DataFrame(columns=["category", "total"])
+            if sup_paid > 0: exp_df = pd.concat([exp_df, pd.DataFrame({"category": ["Supplier payments"], "total": [sup_paid]})], ignore_index=True)
+            if not exp_df.empty and exp_df["total"].astype(float).sum() > 0:
+                st.plotly_chart(expenses_fig(exp_df), use_container_width=True)
+            else: st.info("No expenses in this period.")
+
+# =============================================================================
+# TAB 10: USER ACCESS (admin only)
 # =============================================================================
 if tab_users is not None:
     with tab_users:
